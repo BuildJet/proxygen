@@ -183,7 +183,8 @@ class HTTPDownstreamTest : public testing::Test {
         .RetiresOnSaturation();
 
     EXPECT_CALL(*handler, setTransaction(testing::_))
-        .WillOnce(testing::SaveArg<0>(&handler->txn_));
+        .WillOnce(testing::SaveArg<0>(&handler->txn_))
+        .RetiresOnSaturation();
 
     return handler;
   }
@@ -515,6 +516,37 @@ TEST_F(HTTP2DownstreamSessionEarlyShutdownTest, EarlyShutdown) {
   expectDetachSession();
   httpSession_->notifyPendingShutdown();
   httpSession_->startNow();
+  eventBase_.loop();
+  parseOutput(*clientCodec_);
+}
+
+TEST_F(HTTP2DownstreamSessionEarlyShutdownTest, EarlyShutdownDoubleGoaway) {
+  folly::DelayedDestruction::DestructorGuard g(httpSession_);
+  httpSession_->enableDoubleGoawayDrain();
+
+  StrictMock<MockHTTPCodecCallback> callbacks;
+  clientCodec_->setCallback(&callbacks);
+  EXPECT_CALL(callbacks, onFrameHeader(_, _, _, _, _)).Times(3);
+  EXPECT_CALL(callbacks, onSettings(_)).Times(1);
+  EXPECT_CALL(callbacks, onGoaway(_, _, _)).Times(2);
+  expectDetachSession();
+  httpSession_->notifyPendingShutdown();
+  httpSession_->startNow();
+  eventBase_.loop();
+  parseOutput(*clientCodec_);
+}
+
+TEST_F(HTTP2DownstreamSessionTest, ShutdownDoubleGoaway) {
+  folly::DelayedDestruction::DestructorGuard g(httpSession_);
+  httpSession_->enableDoubleGoawayDrain();
+
+  StrictMock<MockHTTPCodecCallback> callbacks;
+  clientCodec_->setCallback(&callbacks);
+  EXPECT_CALL(callbacks, onFrameHeader(_, _, _, _, _)).Times(3);
+  EXPECT_CALL(callbacks, onSettings(_)).Times(1);
+  EXPECT_CALL(callbacks, onGoaway(_, _, _)).Times(2);
+  expectDetachSession();
+  httpSession_->notifyPendingShutdown();
   eventBase_.loop();
   parseOutput(*clientCodec_);
 }
@@ -970,6 +1002,71 @@ TEST_F(HTTPDownstreamSessionTest, MultiMessage) {
   transport_->addReadEOF(milliseconds(0));
   transport_->startReadEvents();
   eventBase_.loop();
+}
+
+TEST_F(HTTPDownstreamSessionTest, ClientPipelined) {
+  InSequence enforceOrder;
+
+  std::vector<std::unique_ptr<testing::NiceMock<MockHTTPHandler>>> handlers;
+  for (auto i = 0; i < 4; i++) {
+    auto handler = addSimpleNiceHandler();
+    handler->expectHeaders([i](std::shared_ptr<HTTPMessage> req) {
+      EXPECT_EQ(req->getHeaders().getSingleOrEmpty("Id"),
+                folly::to<std::string>(i + 1));
+    });
+    handler->expectEOM([h = handler.get()] { h->sendReplyWithBody(200, 100); });
+    handler->expectDetachTransaction();
+    handlers.push_back(std::move(handler));
+  }
+
+  transport_->addReadEvent(
+      "GET /echo HTTP/1.1\r\n"
+      "Host: jojo\r\n"
+      "Id: 1\r\n"
+      "\r\n"
+      "GET /echo HTTP/1.1\r\n"
+      "Host: jojo\r\n"
+      "Id: 2\r\n"
+      "\r\n"
+      "GET /echo HTTP/1.1\r\n"
+      "Host: jojo\r\n"
+      "Id: 3\r\n"
+      "\r\n"
+      "GET /echo HTTP/1.1\r\n"
+      "Host: jojo\r\n"
+      "Id: 4\r\n"
+      "\r\n",
+      milliseconds(0));
+  transport_->addReadEOF(milliseconds(0));
+  transport_->startReadEvents();
+  expectDetachSession();
+  eventBase_.loop();
+}
+
+TEST_F(HTTPDownstreamSessionTest, BadContentLength) {
+  InSequence enforceOrder;
+
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectBody([](uint64_t, std::shared_ptr<folly::IOBuf> body) {
+    EXPECT_EQ(body->computeChainDataLength(), 6);
+  });
+  handler->expectEOM([&handler] { handler->sendReplyWithBody(200, 100); });
+  handler->expectDetachTransaction();
+
+  // Test sending more bytes than advertised in Content-Length.  The proxy will
+  // ignore these since Connection: close was also specified.
+  //
+  // One could argue it would be better to 400 this kind of request.
+  auto req = getGetRequest();
+  req.setHTTPVersion(1, 0);
+  req.setWantsKeepalive(false);
+  req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH, "6");
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateBody(
+      requests_, streamID, makeBuf(10), HTTPCodec::NoPadding, true);
+  expectDetachSession();
+  flushRequestsAndLoop();
 }
 
 TEST_F(HTTPDownstreamSessionTest, Connect) {
@@ -2150,20 +2247,17 @@ TEST_F(HTTPDownstreamSessionTest, WriteTimeoutPipeline) {
       "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
   requests_.append(buf, strlen(buf));
 
-  InSequence handlerSequence;
+  auto handler2 = addSimpleNiceHandler();
   auto handler1 = addSimpleNiceHandler();
   handler1->expectHeaders();
   handler1->expectEOM([&handler1, this] {
     handler1->sendHeaders(200, 100);
-    eventBase_.tryRunAfterDelay(
-        [&handler1, this] {
-          transport_->pauseWrites();
-          handler1->sendBody(100);
-          handler1->txn_->sendEOM();
-        },
-        50);
+    eventBase_.runInLoop([&handler1, this] {
+      transport_->pauseWrites();
+      handler1->sendBody(100);
+      handler1->txn_->sendEOM();
+    });
   });
-  auto handler2 = addSimpleNiceHandler();
   handler2->expectHeaders();
   handler2->expectEOM();
   handler2->expectError([&](const HTTPException& ex) {
@@ -2527,7 +2621,7 @@ TEST_F(HTTPDownstreamSessionTest, HttpUpgradeNativeExtra) {
       "\r\n");
   flushRequestsAndLoop();
   expect101(CodecProtocol::SPDY_3, "spdy/3");
-  expectResponse(200, ErrorCode::_SPDY_INVALID_STREAM);
+  expectResponse(200, ErrorCode::STREAM_CLOSED);
   gracefulShutdown();
 }
 

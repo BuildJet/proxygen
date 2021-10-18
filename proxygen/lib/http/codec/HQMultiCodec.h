@@ -73,6 +73,11 @@ class HQMultiCodec : public HQControlCodec {
     codecs_.erase(streamId);
   }
 
+  void setResumeHook(StreamID streamId,
+                     folly::Function<void()> hook = nullptr) {
+    getCodec(streamId).setResumeHook(std::move(hook));
+  }
+
   QPACKCodec& getQPACKCodec() {
     return qpackCodec_;
   }
@@ -83,6 +88,20 @@ class HQMultiCodec : public HQControlCodec {
 
   folly::IOBufQueue& getQPACKDecoderWriteBuf() {
     return qpackDecoderWriteBuf_;
+  }
+
+  void encodeCancelStream(quic::StreamId id) {
+    auto cancel = qpackCodec_.encodeCancelStream(id);
+    qpackDecoderWriteBuf_.append(std::move(cancel));
+  }
+
+  bool encodeInsertCountIncrement() {
+    auto ici = qpackCodec_.encodeInsertCountInc();
+    if (ici) {
+      qpackDecoderWriteBuf_.append(std::move(ici));
+      return true;
+    }
+    return false;
   }
 
   void setCallback(proxygen::HTTPCodec::Callback* callback) override {
@@ -111,6 +130,12 @@ class HQMultiCodec : public HQControlCodec {
 
   bool isReusable() const override {
     return !sentGoaway_;
+  }
+
+  bool isParserPaused() const override {
+    auto res = getCurrentCodec().isParserPaused();
+    currentStream_ = HTTPCodec::MaxStreamID;
+    return res;
   }
 
   bool supportsParallelRequests() const override {
@@ -194,15 +219,30 @@ class HQMultiCodec : public HQControlCodec {
     return getCodec(currentStream_);
   }
 
-  HTTPCodec& getCodec(StreamID stream) {
+  const HTTPCodec& getCurrentCodec() const {
+    return getCodec(currentStream_);
+  }
+
+  HQStreamCodec& getCodec(StreamID stream) {
+    auto it = codecs_.find(stream);
+    CHECK(it != codecs_.end()) << "stream=" << stream;
+    return *it->second;
+  }
+
+  const HQStreamCodec& getCodec(StreamID stream) const {
     auto it = codecs_.find(stream);
     CHECK(it != codecs_.end()) << "stream=" << stream;
     return *it->second;
   }
 
   HTTPSettings ingressSettings_;
-  HTTPSettings egressSettings_;
-  StreamID currentStream_{HTTPCodec::MaxStreamID};
+  // Turn peer's QPACK dynamic table on by default
+  HTTPSettings egressSettings_{
+      {SettingsId::HEADER_TABLE_SIZE, kDefaultEgressHeaderTableSize},
+      {SettingsId::MAX_HEADER_LIST_SIZE, kDefaultEgressMaxHeaderListSize},
+      {SettingsId::_HQ_QPACK_BLOCKED_STREAMS,
+       hq::kDefaultEgressQpackBlockedStream}};
+  mutable StreamID currentStream_{HTTPCodec::MaxStreamID};
   folly::F14FastMap<StreamID, std::unique_ptr<HQStreamCodec>> codecs_;
   QPACKCodec qpackCodec_;
   folly::IOBufQueue qpackEncoderWriteBuf_{

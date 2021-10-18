@@ -94,6 +94,9 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
   };
 
  public:
+  using StreamStateMap = std::map<StreamId, StreamState>;
+  using StreamStatePair = std::pair<const StreamId, StreamState>;
+
   explicit MockQuicSocketDriver(folly::EventBase* eventBase,
                                 QuicSocket::ConnectionCallback& cb,
                                 TransportEnum transportType,
@@ -349,13 +352,73 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
               return notifyPendingWriteImpl(quic::kConnectionStreamId, wcb);
             }));
 
+    EXPECT_CALL(*sock_, getDatagramSizeLimit())
+        .WillRepeatedly(testing::Invoke(
+            [this]() -> uint16_t { return getDatagramSizeLimitImpl(); }));
+
+    EXPECT_CALL(*sock_, setDatagramCallback(testing::_))
+        .WillRepeatedly(testing::Invoke(
+            [this](QuicSocket::DatagramCallback* cb)
+                -> folly::Expected<folly::Unit, quic::LocalErrorCode> {
+              auto& connStream = streams_[kConnectionStreamId];
+              if (connStream.writeState == CLOSED) {
+                return folly::makeUnexpected(
+                    quic::LocalErrorCode::CONNECTION_CLOSED);
+              }
+              datagramCB_ = cb;
+              return folly::unit;
+            }));
+
+    EXPECT_CALL(*sock_, writeDatagram(testing::_))
+        .WillRepeatedly(
+            testing::Invoke([this](MockQuicSocket::SharedBuf data)
+                                -> quic::MockQuicSocket::WriteResult {
+              auto& connStream = streams_[kConnectionStreamId];
+              if (connStream.writeState == CLOSED) {
+                return folly::makeUnexpected(
+                    quic::LocalErrorCode::CONNECTION_CLOSED);
+              }
+              if (data->computeChainDataLength() >
+                  this->getDatagramSizeLimitImpl()) {
+                return folly::makeUnexpected(
+                    quic::LocalErrorCode::INVALID_WRITE_DATA);
+              }
+              outDatagrams_.emplace_back(data->clone());
+              return folly::unit;
+            }));
+
+    EXPECT_CALL(*sock_, readDatagrams(testing::_))
+        .WillRepeatedly(testing::Invoke(
+            [this](size_t atMost) -> folly::Expected<std::vector<quic::Buf>,
+                                                     quic::LocalErrorCode> {
+              auto& connStream = streams_[kConnectionStreamId];
+              if (connStream.writeState == CLOSED) {
+                return folly::makeUnexpected(
+                    quic::LocalErrorCode::CONNECTION_CLOSED);
+              }
+              if (atMost == 0) {
+                atMost = inDatagrams_.size();
+              } else {
+                atMost = std::min(atMost, inDatagrams_.size());
+              }
+              std::vector<Buf> retDatagrams;
+              retDatagrams.reserve(atMost);
+              std::transform(inDatagrams_.begin(),
+                             inDatagrams_.begin() + atMost,
+                             std::back_inserter(retDatagrams),
+                             [](BufQueue& bq) { return bq.move(); });
+              inDatagrams_.erase(inDatagrams_.begin(),
+                                 inDatagrams_.begin() + atMost);
+              return retDatagrams;
+            }));
+
     EXPECT_CALL(*sock_,
                 writeChain(testing::_, testing::_, testing::_, testing::_))
         .WillRepeatedly(
             testing::Invoke([this](StreamId id,
                                    MockQuicSocket::SharedBuf data,
                                    bool eof,
-                                   QuicSocket::DeliveryCallback* cb)
+                                   QuicSocket::ByteEventCallback* cb)
                                 -> quic::MockQuicSocket::WriteResult {
               ERROR_IF(id == kConnectionStreamId,
                        "writeChain(kConnectionStreamId) not handled",
@@ -404,8 +467,12 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
               } else if (eof) {
                 stream.pendingWriteEOF = eof;
               }
-              if (stream.unsentBuf.empty() && cb) {
-                stream.deliveryCallbacks.push_back({stream.writeOffset, cb});
+              if (cb) {
+                auto targetOffset =
+                    stream.writeOffset + stream.unsentBuf.chainLength();
+                cb->onByteEventRegistered(
+                    {id, targetOffset, quic::QuicSocket::ByteEvent::Type::ACK});
+                stream.deliveryCallbacks.push_back({targetOffset, cb});
               }
               eventBase_->runInLoop([this, deleted = deleted_] {
                 if (!*deleted) {
@@ -423,7 +490,7 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
             testing::Invoke([this](StreamId id,
                                    const BufferMeta& data,
                                    bool eof,
-                                   QuicSocket::DeliveryCallback* cb)
+                                   QuicSocket::ByteEventCallback* cb)
                                 -> quic::MockQuicSocket::WriteResult {
               ERROR_IF(id == kConnectionStreamId,
                        "writeChain(kConnectionStreamId) not handled",
@@ -480,13 +547,13 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
               } else if (eof) {
                 stream.pendingWriteEOF = eof;
               }
-              // Man i don't really know why in the writeBuf case there is an
-              // extra condition to set deliveryCallback.
               if (cb) {
-                stream.deliveryCallbacks.push_back(
-                    {stream.pendingBufMeta.offset +
-                         stream.pendingBufMeta.length,
-                     cb});
+                auto targetOffset = stream.pendingBufMeta.offset +
+                                    stream.pendingBufMeta.length +
+                                    stream.unsentBufMeta.length;
+                cb->onByteEventRegistered(
+                    {id, targetOffset, quic::QuicSocket::ByteEvent::Type::ACK});
+                stream.deliveryCallbacks.push_back({targetOffset, cb});
               }
               eventBase_->runInLoop([this, deleted = deleted_] {
                 if (!*deleted) {
@@ -525,9 +592,11 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
               auto& stream = streams_[id];
               stream.error = error;
               stream.writeState = ERROR;
+              stream.unsentBuf.move();
               stream.pendingWriteBuf.move();
               stream.pendingWriteCb = nullptr;
               stream.pendingBufMeta.length = 0;
+              stream.unsentBufMeta.length = 0;
               cancelDeliveryCallbacks(id, stream);
               return folly::unit;
             }));
@@ -554,7 +623,7 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
         .WillRepeatedly(testing::Invoke([this](bool /*replaySafe*/) {
           auto streamId = nextBidirectionalStreamId_;
           nextBidirectionalStreamId_ += 4;
-          streams_[streamId];
+          streams_[streamId].readState = OPEN;
           return streamId;
         }));
     EXPECT_CALL(*sock_, createUnidirectionalStream(testing::_))
@@ -619,7 +688,9 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
                   return folly::makeUnexpected(
                       LocalErrorCode::STREAM_NOT_EXISTS));
               return it->second.pendingWriteBuf.chainLength() +
-                     it->second.pendingBufMeta.length;
+                     it->second.unsentBuf.chainLength() +
+                     it->second.pendingBufMeta.length +
+                     it->second.unsentBufMeta.length;
             }));
     EXPECT_CALL(*sock_,
                 registerDeliveryCallback(testing::_, testing::_, testing::_))
@@ -628,31 +699,40 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
                    uint64_t offset,
                    MockQuicSocket::ByteEventCallback* cb)
                 -> folly::Expected<folly::Unit, LocalErrorCode> {
+              return sock_->registerByteEventCallback(
+                  quic::QuicSocket::ByteEvent::Type::ACK, id, offset, cb);
+            }));
+    EXPECT_CALL(*sock_,
+                registerByteEventCallback(
+                    testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Invoke(
+            [this](MockQuicSocket::ByteEvent::Type type,
+                   quic::StreamId id,
+                   uint64_t offset,
+                   MockQuicSocket::ByteEventCallback* cb)
+                -> folly::Expected<folly::Unit, LocalErrorCode> {
               checkNotReadOnlyStream(id);
               auto it = streams_.find(id);
               if (it == streams_.end()) {
                 return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
               }
-              if (it->second.writeOffset >= offset) {
-                // already available, fire the cb from the loop
-                eventBase_->runInLoop(
-                    [id, offset, cb] {
-                      QuicSocket::ByteEvent byteEvent = {};
-                      byteEvent.id = id;
-                      byteEvent.offset = offset;
-                      byteEvent.type = QuicSocket::ByteEvent::Type::ACK;
-                      cb->onByteEvent(byteEvent);
-                    },
-                    /*thisIteration=*/true);
-                return folly::unit;
-              }
-
               ERROR_IF(it->second.writeState == CLOSED,
                        folly::format(
                            "registerDeliveryCallback on CLOSED streamId={}", id)
                            .str(),
                        return folly::makeUnexpected(
                            LocalErrorCode::STREAM_NOT_EXISTS));
+              cb->onByteEventRegistered({id, offset, type});
+              if (it->second.writeOffset >= offset) {
+                // already available, fire the cb from the loop
+                eventBase_->runInLoop(
+                    [id, offset, type, cb] {
+                      cb->onByteEvent({id, offset, type});
+                    },
+                    /*thisIteration=*/true);
+                return folly::unit;
+              }
+
               it->second.deliveryCallbacks.push_back({offset, cb});
               return folly::unit;
             }));
@@ -667,6 +747,10 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
         .WillRepeatedly(testing::ReturnRef(localAddress_));
     EXPECT_CALL(*sock_, getPeerAddress())
         .WillRepeatedly(testing::ReturnRef(peerAddress_));
+  }
+
+  uint16_t getDatagramSizeLimitImpl() {
+    return quic::kDefaultUDPSendPacketLen - quic::kMaxDatagramPacketOverhead;
   }
 
   quic::StreamId getMaxStreamId() {
@@ -805,12 +889,10 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
 
   void cancelDeliveryCallbacks(quic::StreamId id, StreamState& stream) {
     while (!stream.deliveryCallbacks.empty()) {
-      QuicSocket::ByteEvent cancellation = {};
-      cancellation.id = id;
-      cancellation.offset = stream.deliveryCallbacks.front().first;
-      cancellation.type = QuicSocket::ByteEvent::Type::ACK;
       stream.deliveryCallbacks.front().second->onByteEventCanceled(
-          cancellation);
+          {id,
+           stream.deliveryCallbacks.front().first,
+           QuicSocket::ByteEvent::Type::ACK});
       stream.deliveryCallbacks.pop_front();
     }
   }
@@ -911,11 +993,10 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
                stream.deliveryCallbacks.front().first <=
                    stream.pendingBufMeta.offset +
                        stream.pendingBufMeta.length)) {
-            QuicSocket::ByteEvent byteEvent = {};
-            byteEvent.id = id;
-            byteEvent.offset = stream.deliveryCallbacks.front().first;
-            byteEvent.type = QuicSocket::ByteEvent::Type::ACK;
-            stream.deliveryCallbacks.front().second->onByteEvent(byteEvent);
+            stream.deliveryCallbacks.front().second->onByteEvent(
+                {id,
+                 stream.deliveryCallbacks.front().first,
+                 QuicSocket::ByteEvent::Type::ACK});
             stream.deliveryCallbacks.pop_front();
           }
         },
@@ -979,6 +1060,18 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
     }
   }
 
+  void addDatagramsAvailableReadEvent(
+      std::chrono::milliseconds delayFromPrevious =
+          std::chrono::milliseconds(0)) {
+    addReadEventInternal(kConnectionStreamId,
+                         nullptr,
+                         false,
+                         folly::none,
+                         delayFromPrevious,
+                         false,
+                         true);
+  }
+
   void addReadEvent(StreamId streamId,
                     std::unique_ptr<folly::IOBuf> buf,
                     std::chrono::milliseconds delayFromPrevious =
@@ -1017,6 +1110,10 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
     QuicErrorCode qec = error;
     addReadEventInternal(
         streamId, nullptr, false, qec, delayFromPrevious, true);
+  }
+
+  void addDatagram(std::unique_ptr<folly::IOBuf> datagram) {
+    inDatagrams_.emplace_back(std::move(datagram));
   }
 
   void setReadError(StreamId streamId) {
@@ -1080,8 +1177,14 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
               std::unique_ptr<folly::IOBuf> b,
               bool e,
               folly::Optional<QuicErrorCode> er,
-              bool ss)
-        : streamId(s), buf(std::move(b)), eof(e), error(er), stopSending(ss) {
+              bool ss,
+              bool da = false)
+        : streamId(s),
+          buf(std::move(b)),
+          eof(e),
+          error(er),
+          stopSending(ss),
+          datagramsAvailable(da) {
     }
 
     StreamId streamId;
@@ -1089,6 +1192,7 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
     bool eof;
     folly::Optional<QuicErrorCode> error;
     bool stopSending;
+    bool datagramsAvailable;
   };
 
   void addReadEventInternal(StreamId streamId,
@@ -1097,9 +1201,11 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
                             folly::Optional<QuicErrorCode> error,
                             std::chrono::milliseconds delayFromPrevious =
                                 std::chrono::milliseconds(0),
-                            bool stopSending = false) {
+                            bool stopSending = false,
+                            bool datagramsAvailable = false) {
     std::vector<ReadEvent> events;
-    events.emplace_back(streamId, std::move(buf), eof, error, stopSending);
+    events.emplace_back(
+        streamId, std::move(buf), eof, error, stopSending, datagramsAvailable);
     addReadEvents(std::move(events), delayFromPrevious);
   }
 
@@ -1138,6 +1244,11 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
                                      event.streamId)
                            .str(),
                        return );
+            }
+            if (event.streamId == kConnectionStreamId &&
+                event.datagramsAvailable && !event.error && datagramCB_) {
+              datagramCB_->onDatagramsAvailable();
+              continue;
             }
             auto bufLen = event.buf ? event.buf->computeChainDataLength() : 0;
             stream.readBufOffset += bufLen;
@@ -1212,21 +1323,40 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
         (transportType_ == TransportEnum::CLIENT && sock_->isServerStream(id)));
   }
 
-  void pauseOrResumeWrites(StreamState& stream, quic::StreamId streamId) {
+  enum class PauseResumeResult { NONE = 0, PAUSED = 1, RESUMED = 2 };
+  PauseResumeResult pauseOrResumeWrites(StreamState& stream,
+                                        quic::StreamId streamId) {
     if (stream.writeState == OPEN && stream.flowControlWindow == 0) {
       pauseWrites(streamId);
+      return PauseResumeResult::PAUSED;
     } else if (stream.writeState == PAUSED && stream.flowControlWindow > 0) {
       resumeWrites(streamId);
+      return PauseResumeResult::RESUMED;
     }
+    return PauseResumeResult::NONE;
   }
 
   void setConnectionFlowControlWindow(uint64_t windowSize) {
-    auto& stream = streams_[kConnectionStreamId];
-    ERROR_IF(stream.writeState == CLOSED,
+    auto& connStream = streams_[kConnectionStreamId];
+    ERROR_IF(connStream.writeState == CLOSED,
              "setConnectionFlowControlWindow on CLOSED connection",
              return );
-    stream.flowControlWindow = windowSize;
-    pauseOrResumeWrites(stream, kConnectionStreamId);
+    connStream.flowControlWindow = windowSize;
+    if (pauseOrResumeWrites(connStream, kConnectionStreamId) ==
+        PauseResumeResult::RESUMED) {
+      // Connection Flow control became unblocked, resume any streams that were
+      // blocked on connection flow control
+      for (auto& stream : streams_) {
+        if (stream.first == kConnectionStreamId) {
+          continue;
+        }
+        if ((!stream.second.unsentBuf.empty() ||
+             stream.second.unsentBufMeta.length > 0) &&
+            stream.second.flowControlWindow > 0) {
+          resumeWrites(stream.first, /*connFCEvent=*/true);
+        }
+      }
+    }
   }
 
   void setStreamFlowControlWindow(StreamId streamId, uint64_t windowSize) {
@@ -1257,10 +1387,10 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
     cancelDeliveryCallbacks(streamId, stream);
   }
 
-  void resumeWrites(StreamId streamId) {
+  void resumeWrites(StreamId streamId, bool connFCEvent = false) {
     auto& stream = streams_[streamId];
     ERROR_IF(
-        stream.writeState != PAUSED,
+        stream.writeState != PAUSED && !connFCEvent,
         folly::format("resumeWrites on not PAUSED streamId={}", streamId).str(),
         return );
     stream.writeState = OPEN;
@@ -1355,7 +1485,7 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
   TransportSettings transportSettings_;
   uint64_t bufferAvailable_{std::numeric_limits<uint64_t>::max()};
   // keeping this ordered for better debugging
-  std::map<StreamId, StreamState> streams_;
+  StreamStateMap streams_;
   std::list<folly::Func> events_;
   TransportEnum transportType_;
   std::shared_ptr<MockQuicSocket> sock_;
@@ -1368,6 +1498,9 @@ class MockQuicSocketDriver : public folly::EventBase::LoopCallback {
   std::shared_ptr<bool> deleted_{new bool(false)};
   LocalAppCallback* localAppCb_{nullptr};
   std::string alpn_;
+  QuicSocket::DatagramCallback* datagramCB_{nullptr};
+  std::vector<quic::BufQueue> outDatagrams_{};
+  std::vector<quic::BufQueue> inDatagrams_{};
   folly::SocketAddress localAddress_;
   folly::SocketAddress peerAddress_;
 }; // namespace quic

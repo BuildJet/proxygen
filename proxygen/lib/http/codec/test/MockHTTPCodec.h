@@ -30,6 +30,7 @@ class MockHTTPCodec : public HTTPCodec {
   MOCK_CONST_METHOD0(isBusy, bool());
   MOCK_CONST_METHOD0(hasPartialTransaction, bool());
   MOCK_METHOD1(setParserPaused, void(bool));
+  MOCK_CONST_METHOD0(isParserPaused, bool());
   MOCK_METHOD1(onIngress, size_t(const folly::IOBuf&));
   MOCK_METHOD0(onIngressEOF, void());
   MOCK_CONST_METHOD0(isReusable, bool());
@@ -194,6 +195,7 @@ class MockHTTPCodecCallback : public HTTPCodec::Callback {
              code,
              std::shared_ptr<folly::IOBuf>(debugData.release()));
   }
+  MOCK_METHOD2(onUnknownFrame, void(uint64_t, uint64_t));
   MOCK_METHOD1(onPingRequest, void(uint64_t));
   MOCK_METHOD1(onPingReply, void(uint64_t));
   MOCK_METHOD2(onWindowUpdate, void(HTTPCodec::StreamID, uint32_t));

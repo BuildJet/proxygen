@@ -189,6 +189,11 @@ class MockHTTPHandler
                          void(uint64_t bodyOffset,
                               std::shared_ptr<folly::IOBuf> chain));
 
+  void onDatagram(std::unique_ptr<folly::IOBuf> chain) noexcept override {
+    onDatagram(std::shared_ptr<folly::IOBuf>(chain.release()));
+  }
+  GMOCK_NOEXCEPT_METHOD1(onDatagram, void(std::shared_ptr<folly::IOBuf> chain));
+
   GMOCK_NOEXCEPT_METHOD1(onChunkHeader, void(size_t length));
 
   GMOCK_NOEXCEPT_METHOD0(onChunkComplete, void());
@@ -297,6 +302,22 @@ class MockHTTPHandler
         .WillOnce(testing::Invoke(callback));
   }
 
+  void expectDatagram(
+      std::function<void()> callback = std::function<void()>()) {
+    if (callback) {
+      EXPECT_CALL(*this, onDatagram(testing::_))
+          .WillOnce(testing::InvokeWithoutArgs(callback));
+    } else {
+      EXPECT_CALL(*this, onDatagram(testing::_));
+    }
+  }
+
+  void expectDatagram(
+      std::function<void(std::shared_ptr<folly::IOBuf>)> callback) {
+    EXPECT_CALL(*this, onDatagram(testing::_))
+        .WillOnce(testing::Invoke(callback));
+  }
+
   void expectChunkComplete(
       std::function<void()> callback = std::function<void()>()) {
     if (callback) {
@@ -337,9 +358,10 @@ class MockHTTPHandler
                        std::function<void(const HTTPException& ex)>()) {
     if (callback) {
       EXPECT_CALL(*this, onError(testing::_))
-          .WillOnce(testing::Invoke(callback));
+          .WillOnce(testing::Invoke(callback))
+          .RetiresOnSaturation();
     } else {
-      EXPECT_CALL(*this, onError(testing::_));
+      EXPECT_CALL(*this, onError(testing::_)).RetiresOnSaturation();
     }
   }
 
@@ -357,9 +379,10 @@ class MockHTTPHandler
       std::function<void()> callback = std::function<void()>()) {
     if (callback) {
       EXPECT_CALL(*this, detachTransaction())
-          .WillOnce(testing::Invoke(callback));
+          .WillOnce(testing::Invoke(callback))
+          .RetiresOnSaturation();
     } else {
-      EXPECT_CALL(*this, detachTransaction());
+      EXPECT_CALL(*this, detachTransaction()).RetiresOnSaturation();
     }
   }
 };

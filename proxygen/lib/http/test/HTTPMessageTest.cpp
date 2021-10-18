@@ -771,3 +771,81 @@ TEST(HTTPHeaders, MoveFromTest) {
   EXPECT_EQ(h1.size(), 0);
   EXPECT_EQ(h3.size(), 1);
 }
+
+TEST(HTTPMessage, DefaultSchemeHttp) {
+  HTTPMessage message;
+  EXPECT_EQ(message.getScheme(), "http");
+  EXPECT_FALSE(message.isSecure());
+}
+
+TEST(HTTPMessage, SchemeHttps) {
+  HTTPMessage message;
+  message.setSecure(true);
+  EXPECT_EQ(message.getScheme(), "https");
+  EXPECT_TRUE(message.isSecure());
+  message.setSecure(false);
+  EXPECT_EQ(message.getScheme(), "http");
+  EXPECT_FALSE(message.isSecure());
+}
+
+TEST(HTTPMessage, SchemeMasque) {
+  HTTPMessage message;
+  message.setMasque();
+  EXPECT_EQ(message.getScheme(), "masque");
+  EXPECT_TRUE(message.isSecure());
+  // Masque is already secure, setting secure again has no effect
+  message.setSecure(true);
+  EXPECT_EQ(message.getScheme(), "masque");
+  EXPECT_TRUE(message.isSecure());
+  // Masque must be secure, so unsetting secure falls back to http://
+  message.setSecure(false);
+  EXPECT_EQ(message.getScheme(), "http");
+  EXPECT_FALSE(message.isSecure());
+}
+
+TEST(HTTPMessage, StrictMode) {
+  HTTPMessage message;
+  EXPECT_FALSE(message.setURL("/foo\xff", /*strict=*/true));
+  EXPECT_EQ(message.getURL(), "/foo\xff");
+  EXPECT_EQ(message.getPath(), "");
+
+  message.setURL("/");
+  // Not strict mode, high ascii OK
+  EXPECT_TRUE(message.setQueryString("a=b\xff"));
+  EXPECT_EQ(message.getURL(), "/?a=b\xff");
+  EXPECT_EQ(message.getPath(), "/");
+  EXPECT_EQ(message.getQueryString(), "a=b\xff");
+
+  EXPECT_TRUE(message.setQueryString("a=b"));
+  EXPECT_EQ(message.getURL(), "/?a=b");
+  EXPECT_FALSE(message.setQueryString("a=b\xff", /*strict=*/true));
+  EXPECT_EQ(message.getURL(), "/?a=b\xff");
+  EXPECT_EQ(message.getQueryString(), "");
+
+  EXPECT_TRUE(message.setQueryString("a=b"));
+  EXPECT_FALSE(message.setQueryParam("c", "d\xff", /*strict=*/true));
+  EXPECT_EQ(message.getURL(), "/?a=b&c=d\xff");
+  EXPECT_EQ(message.getQueryString(), "");
+  EXPECT_TRUE(message.setQueryParam("c", "d\xff", /*strict=*/false));
+  EXPECT_EQ(message.getURL(), "/?a=b&c=d\xff");
+
+  // Can remove a param without failing the strict parsing
+  EXPECT_TRUE(message.setURL("/?a=b&c=d\xff"));
+  EXPECT_TRUE(message.removeQueryParam("a"));
+  EXPECT_TRUE(message.removeQueryParam("c"));
+}
+
+#ifdef NDEBUG
+// This fails DCHECKs in debug mode, throws in opt
+TEST(HTTPMessage, BadAPIUsage) {
+  HTTPMessage req;
+  req.setURL("/");
+  EXPECT_THROW(req.getStatusCode(), std::runtime_error);
+  EXPECT_EQ(req.getURL(), "/");
+
+  HTTPMessage resp;
+  resp.setStatusCode(200);
+  EXPECT_THROW(resp.getQueryString(), std::runtime_error);
+  EXPECT_EQ(resp.getStatusCode(), 200);
+}
+#endif

@@ -8,13 +8,13 @@
 
 #pragma once
 
+#include <folly/container/EvictingCacheMap.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/DelayedDestructionBase.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/lang/Assume.h>
 #include <proxygen/lib/http/codec/HQControlCodec.h>
-#include <proxygen/lib/http/codec/HQStreamCodec.h>
 #include <proxygen/lib/http/codec/HQUnidirectionalCodec.h>
 #include <proxygen/lib/http/codec/HQUtils.h>
 #include <proxygen/lib/http/codec/HTTP1xCodec.h>
@@ -23,8 +23,6 @@
 #include <proxygen/lib/http/codec/HTTPCodec.h>
 #include <proxygen/lib/http/codec/HTTPCodecFilter.h>
 #include <proxygen/lib/http/codec/HTTPSettings.h>
-#include <proxygen/lib/http/codec/QPACKDecoderCodec.h>
-#include <proxygen/lib/http/codec/QPACKEncoderCodec.h>
 #include <proxygen/lib/http/session/HQByteEventTracker.h>
 #include <proxygen/lib/http/session/HQStreamBase.h>
 #include <proxygen/lib/http/session/HQUnidirectionalCallbacks.h>
@@ -42,6 +40,10 @@ class HTTPSessionController;
 class HQSession;
 class VersionUtils;
 
+namespace hq {
+class HQStreamCodec;
+}
+
 std::ostream& operator<<(std::ostream& os, const HQSession& session);
 
 enum class HQVersion : uint8_t {
@@ -50,6 +52,8 @@ enum class HQVersion : uint8_t {
   HQ,        // The real McCoy
 };
 
+extern const std::string kH3;
+extern const std::string kHQ;
 extern const std::string kH3FBCurrentDraft;
 extern const std::string kH3CurrentDraft;
 extern const std::string kH3LegacyDraft;
@@ -59,6 +63,12 @@ extern const std::string kHQCurrentDraft;
 extern const proxygen::http2::PriorityUpdate hqDefaultPriority;
 
 using HQVersionType = std::underlying_type<HQVersion>::type;
+
+constexpr uint8_t kMaxDatagramHeaderSize = 16;
+// Maximum number of datagrams to buffer per stream
+constexpr uint8_t kDefaultMaxBufferedDatagrams = 5;
+// Maximum number of streams with datagrams buffered
+constexpr uint8_t kMaxStreamsWithBufferedDatagrams = 10;
 
 /**
  * Session-level protocol info.
@@ -75,6 +85,7 @@ struct QuicProtocolInfo : public wangle::ProtocolInfo {
   uint32_t totalPTOCount{0};
   uint64_t totalTransportBytesSent{0};
   uint64_t totalTransportBytesRecvd{0};
+  bool usedZeroRtt{false};
 };
 
 /**
@@ -120,10 +131,10 @@ class HQSession
     , public quic::QuicSocket::ReadCallback
     , public quic::QuicSocket::WriteCallback
     , public quic::QuicSocket::DeliveryCallback
+    , public quic::QuicSocket::DatagramCallback
     , public HTTPSessionBase
     , public folly::EventBase::LoopCallback
     , public HQUnidirStreamDispatcher::Callback {
-
   // Forward declarations
  public:
   class HQStreamTransportBase;
@@ -204,6 +215,9 @@ class HQSession
   void setForceUpstream1_1(bool force) {
     forceUpstream1_1_ = force;
   }
+  void setStrictValidation(bool strictValidation) {
+    strictValidation_ = strictValidation;
+  }
 
   void setSessionStats(HTTPSessionStats* stats) override;
 
@@ -215,6 +229,9 @@ class HQSession
                      quic::ApplicationErrorCode error) noexcept override;
 
   void onConnectionEnd() noexcept override;
+
+  void onConnectionSetupError(
+      std::pair<quic::QuicErrorCode, std::string> code) noexcept override;
 
   void onConnectionError(
       std::pair<quic::QuicErrorCode, std::string> code) noexcept override;
@@ -243,6 +260,9 @@ class HQSession
       std::pair<quic::QuicErrorCode, folly::Optional<folly::StringPiece>>
           error) noexcept override;
 
+  // quic::QuicSocket::DatagramCallback
+  void onDatagramsAvailable() noexcept override;
+
   // Only for UpstreamSession
   HTTPTransaction* newTransaction(HTTPTransaction::Handler* handler) override;
 
@@ -258,9 +278,9 @@ class HQSession
                          ? *sock_->getServerConnectionId()
                          : quic::ConnectionId({0, 0, 0, 0});
     if (direction_ == TransportDirection::DOWNSTREAM) {
-      os << ", client CID=" << clientCid << ", server CID=" << serverCid
-         << ", downstream=" << getPeerAddress() << ", " << getLocalAddress()
-         << "=local";
+      os << ", UA=" << userAgent_ << ", client CID=" << clientCid
+         << ", server CID=" << serverCid << ", downstream=" << getPeerAddress()
+         << ", " << getLocalAddress() << "=local";
     } else {
       os << ", client CID=" << clientCid << ", server CID=" << serverCid
          << ", local=" << getLocalAddress() << ", " << getPeerAddress()
@@ -347,6 +367,11 @@ class HQSession
       versionUtilsReady_.then([this, size = maxHeaderListSize->value] {
         versionUtils_->setMaxUncompressed(size);
       });
+    }
+    auto datagramEnabled = egressSettings_.getSetting(SettingsId::_HQ_DATAGRAM);
+    // if enabling H3 datagrams check that the transport supports datagrams
+    if (datagramEnabled && datagramEnabled->value) {
+      datagramEnabled_ = true;
     }
   }
 
@@ -1065,7 +1090,7 @@ class HQSession
 
     std::unique_ptr<hq::HQUnidirectionalCodec> ingressCodec_;
     bool readEOF_{false};
-  };
+  }; // HQControlStream
 
  public:
   class HQStreamTransportBase
@@ -1662,6 +1687,7 @@ class HQSession
     bool hasIngress_{false};
     bool detached_{false};
     bool ingressError_{false};
+    bool canReceiveDatagrams_{false};
     enum class EOMType { CODEC, TRANSPORT };
     ConditionalGate<EOMType, 2> eomGate_;
 
@@ -1766,6 +1792,8 @@ class HQSession
         HTTPCodec::StreamID /* assoc streamID */,
         std::unique_ptr<HTTPMessage> /* promise */) override;
 
+    uint16_t getDatagramSizeLimit() const noexcept override;
+    bool sendDatagram(std::unique_ptr<folly::IOBuf> datagram) override;
   }; // HQStreamTransport
 
 #ifdef _MSC_VER
@@ -1974,9 +2002,6 @@ class HQSession
     return 100;
   }
 
-  HQStreamTransportBase* FOLLY_NULLABLE getPRStream(quic::StreamId id,
-                                                    const char* event);
-
   using HTTPCodecPtr = std::unique_ptr<HTTPCodec>;
   struct CodecStackEntry {
     HTTPCodecPtr* codecPtr;
@@ -2022,6 +2047,9 @@ class HQSession
   bool scheduledWrite_{false};
 
   bool forceUpstream1_1_{true};
+  // Default to false for now to match existing behavior
+  bool strictValidation_{false};
+  bool datagramEnabled_{false};
 
   /** Reads in the current loop iteration */
   uint16_t readsPerLoop_{0};
@@ -2053,6 +2081,14 @@ class HQSession
   // Bidirectional transport streams
   std::unordered_map<quic::StreamId, HQStreamTransport> streams_;
 
+  // Buffer for datagrams waiting for a stream to be assigned to
+  folly::EvictingCacheMap<
+      quic::StreamId,
+      folly::small_vector<std::unique_ptr<folly::IOBuf>,
+                          kDefaultMaxBufferedDatagrams,
+                          folly::small_vector_policy::NoHeap>>
+      datagramsBuffer_{kMaxStreamsWithBufferedDatagrams};
+
   // Creation time (for handshake time tracking)
   std::chrono::steady_clock::time_point createTime_;
 
@@ -2060,6 +2096,7 @@ class HQSession
   folly::F14FastMap<hq::PushId, quic::StreamId> pushIdToStreamId_;
   // Lookup maps for matching ingress push streams to push ids
   folly::F14FastMap<quic::StreamId, hq::PushId> streamIdToPushId_;
+  std::string userAgent_;
 }; // HQSession
 
 std::ostream& operator<<(std::ostream& os, HQSession::DrainState drainState);

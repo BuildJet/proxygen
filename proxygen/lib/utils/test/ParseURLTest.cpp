@@ -20,8 +20,9 @@ void testParseURL(const string& url,
                   const string& expectedHost,
                   const uint16_t expectedPort,
                   const string& expectedAuthority,
-                  const bool expectedValid = true) {
-  ParseURL u(url);
+                  const bool expectedValid = true,
+                  const bool strict = false) {
+  auto u = ParseURL::parseURLMaybeInvalid(url, strict);
 
   if (expectedValid) {
     EXPECT_EQ(url, u.url());
@@ -39,15 +40,16 @@ void testParseURL(const string& url,
 }
 
 void testHostIsIpAddress(const string& url, const bool expected) {
-  ParseURL u(url);
+  auto u = ParseURL::parseURLMaybeInvalid(url);
+  EXPECT_TRUE(!expected || u.valid());
   EXPECT_EQ(expected, u.hostIsIPAddress());
 }
 
 TEST(ParseURL, HostNoBrackets) {
-  ParseURL p("/bar");
+  auto p = ParseURL::parseURL("/bar");
 
-  EXPECT_EQ("", p.host());
-  EXPECT_EQ("", p.hostNoBrackets());
+  EXPECT_EQ("", p->host());
+  EXPECT_EQ("", p->hostNoBrackets());
 }
 
 TEST(ParseURL, FullyFormedURL) {
@@ -202,6 +204,20 @@ TEST(ParseURL, InvalidURL) {
   testParseURL("", "", "", "", "", 0, "", false);
   testParseURL("http://tel:198433511/test\n", "", "", "", "", 0, "", false);
   testParseURL("/test\n", "", "", "", "", 0, "", false);
+  testParseURL(
+      "http://foo.com/test\xff", "", "", "", "", 0, "", false, /*strict=*/true);
+  testParseURL("http://foo.com/test\xff",
+               "http",
+               "/test\xff",
+               "",
+               "foo.com",
+               0,
+               "foo.com",
+               true,
+               /*strict=*/false);
+  testParseURL("test\xff", "", "", "", "", 0, "", false, /*strict=*/true);
+  testParseURL(
+      "/test\xff", "", "/test\xff", "", "", 0, "", true, /*strict=*/false);
 }
 
 TEST(ParseURL, IsHostIPAddress) {
@@ -226,6 +242,7 @@ TEST(ParseURL, IsHostIPAddress) {
 
 TEST(ParseURL, PortOverflow) {
   std::string url("http://foo:12345");
-  ParseURL u(folly::StringPiece(url.data(), url.size() - 4));
-  EXPECT_EQ(u.port(), 1);
+  auto u =
+      ParseURL::parseURL(folly::StringPiece(url.data(), url.size() - 4), true);
+  EXPECT_EQ(u->port(), 1);
 }

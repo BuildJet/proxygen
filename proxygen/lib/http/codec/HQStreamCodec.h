@@ -36,6 +36,10 @@ class HQStreamCodec
                 HTTPSettings& ingressSettings);
   ~HQStreamCodec() override;
 
+  void setStrictValidation(bool strict) {
+    strictValidation_ = strict;
+  }
+
   void setActivationHook(folly::Function<folly::Function<void()>()> hook) {
     activationHook_ = std::move(hook);
   }
@@ -163,16 +167,14 @@ class HQStreamCodec
   size_t generateBodyImpl(folly::IOBufQueue& writeBuf,
                           std::unique_ptr<folly::IOBuf> chain);
 
-  uint64_t getCodecTotalEgressBytes() const {
-    return totalEgressBytes_;
-  }
-
   std::string userAgent_;
   HeaderDecodeInfo decodeInfo_;
   QPACKCodec& headerCodec_;
   folly::IOBufQueue& qpackEncoderWriteBuf_;
   folly::IOBufQueue& qpackDecoderWriteBuf_;
   folly::Function<uint64_t()> qpackEncoderMaxDataFn_;
+  // Default false for now to match existing behavior
+  bool strictValidation_{false};
   bool finalIngressHeadersSeen_{false};
   bool parsingTrailers_{false};
   bool finalEgressHeadersSeen_{false};
@@ -180,8 +182,6 @@ class HQStreamCodec
   folly::Function<folly::Function<void()>()> activationHook_{
       [] { return [] {}; }};
   HTTPSettings& ingressSettings_;
-
-  uint64_t totalEgressBytes_{0};
 };
 } // namespace hq
 } // namespace proxygen

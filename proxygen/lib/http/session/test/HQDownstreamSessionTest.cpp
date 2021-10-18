@@ -43,7 +43,6 @@ using HQDownstreamSessionTestH1qv2HQ = HQDownstreamSessionTest;
 
 // Use this test class for hq only tests
 using HQDownstreamSessionTestHQ = HQDownstreamSessionTest;
-// Use this test class for hq PR only tests
 using HQDownstreamSessionTestHQDeliveryAck = HQDownstreamSessionTest;
 
 // Use this test class for h3 server push tests
@@ -1151,7 +1150,8 @@ TEST_P(HQDownstreamSessionTest, ShutdownDropWithUnflushedResp) {
   auto id = sendRequest();
   // should be enough to trick HQSession into serializing the EOM into
   // HQStreamTransport but without enough to send it.
-  socketDriver_->setStreamFlowControlWindow(id, 206);
+  // HTTP/3 has an extra grease frame on the first transaction
+  socketDriver_->setStreamFlowControlWindow(id, IS_HQ ? 209 : 206);
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders();
   handler->expectEOM([&handler] {
@@ -1229,6 +1229,7 @@ TEST_P(HQDownstreamSessionTest, TransportErrorWithOpenStream) {
     EXPECT_EQ(ex.getProxygenError(), kErrorConnectionReset);
   });
   handler->expectDetachTransaction();
+  EXPECT_CALL(infoCb_, onConnectionError(_)).Times(0);
   flushRequestsAndLoop();
 }
 
@@ -1367,6 +1368,44 @@ TEST_P(HQDownstreamSessionTestHQ, BadHttpHeaders) {
   */
   flushRequestsAndLoop();
   // The QPACK error will cause the connection to get dropped
+}
+
+TEST_P(HQDownstreamSessionTest, BadHttpStrict) {
+  hqSession_->setStrictValidation(true);
+  sendRequest(getGetRequest("/foo\xff"));
+  testing::StrictMock<MockHTTPHandler> handler;
+  EXPECT_CALL(getMockController(), getParseErrorHandler(_, _, _))
+      .WillOnce(Return(&handler));
+  EXPECT_CALL(handler, setTransaction(testing::_))
+      .WillOnce(testing::SaveArg<0>(&handler.txn_));
+  handler.expectError([&handler](const HTTPException& ex) {
+    EXPECT_TRUE(ex.hasHttpStatusCode());
+    handler.sendReplyWithBody(ex.getHttpStatusCode(), 100);
+  });
+  handler.expectDetachTransaction();
+
+  flushRequestsAndLoop();
+  hqSession_->closeWhenIdle();
+}
+
+TEST_P(HQDownstreamSessionTest, BadHttpHeadersStrict) {
+  hqSession_->setStrictValidation(true);
+  auto req = getGetRequest("/foo");
+  req.getHeaders().set("Foo", "bad value\xff");
+  sendRequest(req);
+  testing::StrictMock<MockHTTPHandler> handler;
+  EXPECT_CALL(getMockController(), getParseErrorHandler(_, _, _))
+      .WillOnce(Return(&handler));
+  EXPECT_CALL(handler, setTransaction(testing::_))
+      .WillOnce(testing::SaveArg<0>(&handler.txn_));
+  handler.expectError([&handler](const HTTPException& ex) {
+    EXPECT_TRUE(ex.hasHttpStatusCode());
+    handler.sendReplyWithBody(ex.getHttpStatusCode(), 100);
+  });
+  handler.expectDetachTransaction();
+
+  flushRequestsAndLoop();
+  hqSession_->closeWhenIdle();
 }
 
 // NOTE: this behavior is only valid for basic h1q
@@ -1652,7 +1691,9 @@ TEST_P(HQDownstreamSessionTest, TransactionTimeoutNoCodecId) {
 TEST_P(HQDownstreamSessionTest, SendOnFlowControlPaused) {
   // 106 bytes of resp headers, 1 byte of body but 5 bytes of chunk overhead
   auto id = sendRequest();
-  socketDriver_->setStreamFlowControlWindow(id, 100);
+  // HTTP/3 has an extra grease frame on the first transaction
+  socketDriver_->setStreamFlowControlWindow(id, IS_HQ ? 103 : 100);
+
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders();
   handler->expectEOM([&handler] {
@@ -1933,6 +1974,30 @@ TEST_P(HQDownstreamSessionTest, LocalErrQueuedEgress) {
   flushRequestsAndLoop();
 }
 
+TEST_P(HQDownstreamSessionTest, NoErrorNoStreams) {
+  EXPECT_CALL(infoCb_, onIngressError(_, kErrorNone));
+  socketDriver_->deliverConnectionError(
+      std::make_pair(HTTP3::ErrorCode::HTTP_NO_ERROR, ""));
+  flushRequestsAndLoop();
+}
+
+TEST_P(HQDownstreamSessionTest, NoErrorOneStreams) {
+  sendRequest();
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM();
+  flushRequestsAndLoopN(1);
+  // stream gets an error
+  handler->expectError([](const HTTPException& ex) {
+    EXPECT_EQ(ex.getProxygenError(), kErrorEOF);
+  });
+  handler->expectDetachTransaction();
+  // This is for connection level errors, maybe should be reported a
+  EXPECT_CALL(infoCb_, onIngressError(_, kErrorEOF));
+  socketDriver_->deliverConnectionError(
+      std::make_pair(HTTP3::ErrorCode::HTTP_NO_ERROR, ""));
+}
+
 TEST_P(HQDownstreamSessionTestHQ, Connect) {
   auto handler = addSimpleStrictHandler();
   // Send HTTP 200 OK to accept the CONNECT request
@@ -1948,6 +2013,40 @@ TEST_P(HQDownstreamSessionTestHQ, Connect) {
   proxygen::HTTPMessage req;
   req.setURL("test.net/path");
   req.setMethod("CONNECT");
+  req.getHeaders().add(proxygen::HTTP_HEADER_HOST, "https://test.net/path");
+  auto id = sendRequest(req, /* eom */ false);
+  auto& request = getStream(id);
+
+  auto buf1 = IOBuf::copyBuffer("12345");
+  request.codec->generateBody(
+      request.buf, request.id, std::move(buf1), HTTPCodec::NoPadding, true);
+  flushRequestsAndLoopN(1);
+
+  auto buf2 = IOBuf::copyBuffer("abcdefg");
+  request.codec->generateBody(
+      request.buf, request.id, std::move(buf2), HTTPCodec::NoPadding, true);
+  flushRequestsAndLoopN(1);
+
+  request.readEOF = true;
+  flushRequestsAndLoop();
+  hqSession_->closeWhenIdle();
+}
+
+TEST_P(HQDownstreamSessionTestHQ, ConnectUDP) {
+  auto handler = addSimpleStrictHandler();
+  // Send HTTP 200 OK to accept the CONNECT request
+  handler->expectHeaders([&handler] { handler->sendHeaders(200, 100); });
+  handler->expectEOM([&] { handler->terminate(); });
+
+  // Data should be received using onBody
+  EXPECT_CALL(*handler, onBodyWithOffset(_, _))
+      .WillOnce(ExpectString("12345"))
+      .WillOnce(ExpectString("abcdefg"));
+  handler->expectDetachTransaction();
+
+  proxygen::HTTPMessage req;
+  req.setURL("test.net/path");
+  req.setMethod("CONNECT-UDP");
   req.getHeaders().add(proxygen::HTTP_HEADER_HOST, "https://test.net/path");
   auto id = sendRequest(req, /* eom */ false);
   auto& request = getStream(id);
@@ -2212,6 +2311,50 @@ TEST_P(HQDownstreamSessionTestHQ, DelayedQPACKStopSendingReset) {
   hqSession_->closeWhenIdle();
 }
 
+TEST_P(HQDownstreamSessionTestHQ, QPACKHeadersTooLarge) {
+  hqSession_->setEgressSettings({{SettingsId::MAX_HEADER_LIST_SIZE, 60}});
+  auto req = getGetRequest();
+  req.getHeaders().add("X-FB-Debug", "rfccffgvtvnenjkbtitkfdufddnvbecu");
+  auto id = sendRequest(req);
+  testing::StrictMock<MockHTTPHandler> errHandler;
+  EXPECT_CALL(getMockController(), getParseErrorHandler(_, _, _))
+      .WillOnce(Return(&errHandler));
+  EXPECT_CALL(errHandler, setTransaction(testing::_))
+      .WillOnce(testing::SaveArg<0>(&errHandler.txn_));
+  errHandler.expectError([&errHandler](const HTTPException& ex) {
+    EXPECT_EQ(ex.getHttp3ErrorCode(),
+              (uint32_t)HTTP3::ErrorCode::HTTP_QPACK_DECOMPRESSION_FAILED);
+    errHandler.sendReplyWithBody(400, 100);
+  });
+  errHandler.expectDetachTransaction();
+  flushRequestsAndLoopN(2);
+  // Gets a response
+  EXPECT_GT(socketDriver_->streams_[id].writeBuf.chainLength(), 30);
+  EXPECT_EQ(*socketDriver_->streams_[id].error,
+            (uint32_t)HTTP3::ErrorCode::HTTP_QPACK_DECOMPRESSION_FAILED);
+  auto decoderStream = socketDriver_->streams_[kQPACKDecoderEgressStreamId]
+                           .writeBuf.front()
+                           ->clone();
+  decoderStream->coalesce();
+  // preface, cancel, ici
+  EXPECT_EQ(decoderStream->computeChainDataLength(), 3);
+  EXPECT_EQ(decoderStream->data()[1], 0x40); // stream 0 cancelled
+
+  // But the conn is still usable
+  sendRequest();
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM([hdlr = handler.get(), this] {
+    HTTPMessage resp;
+    resp.setStatusCode(200);
+    hdlr->txn_->sendHeaders(resp);
+    hdlr->txn_->sendEOM();
+    hqSession_->closeWhenIdle();
+  });
+  handler->expectDetachTransaction();
+  flushRequestsAndLoop();
+}
+
 TEST_P(HQDownstreamSessionBeforeTransportReadyTest, NotifyPendingShutdown) {
   hqSession_->notifyPendingShutdown();
   SetUpOnTransportReady();
@@ -2348,7 +2491,8 @@ TEST_P(HQDownstreamSessionTestH1q, httpPausedBufferedDetach) {
   auto handler1 = addSimpleStrictHandler();
   handler1->expectHeaders();
   handler1->expectEOM([&handler1, this, id1] {
-    socketDriver_->setStreamFlowControlWindow(id1, 199);
+    // HTTP/3 has an extra grease frame on the first transaction
+    socketDriver_->setStreamFlowControlWindow(id1, IS_HQ ? 202 : 199);
     handler1->sendHeaders(200, 100);
     handler1->sendBody(100);
     eventBase_.runInLoop([&handler1] {
@@ -2527,6 +2671,39 @@ TEST_P(HQDownstreamSessionTestHQ, TooManyControlStreams) {
             HTTP3::ErrorCode::HTTP_STREAM_CREATION_ERROR);
 }
 
+TEST_P(HQDownstreamSessionTestHQ, TestGreaseFramePerSession) {
+  // a grease frame will be created in the first bidir stream
+  auto idh1 = checkRequest();
+  flushRequestsAndLoop();
+  EXPECT_GT(socketDriver_->streams_[idh1.first].writeBuf.chainLength(), 110);
+  FakeHTTPCodecCallback callback1;
+  std::unique_ptr<HQStreamCodec> upstreamCodec =
+      std::make_unique<hq::HQStreamCodec>(
+          idh1.first,
+          TransportDirection::UPSTREAM,
+          qpackCodec_,
+          encoderWriteBuf_,
+          decoderWriteBuf_,
+          [] { return std::numeric_limits<uint64_t>::max(); },
+          ingressSettings_);
+  upstreamCodec->setCallback(&callback1);
+  upstreamCodec->onIngress(
+      *socketDriver_->streams_[idh1.first].writeBuf.front());
+  EXPECT_EQ(callback1.unknownFrames, 1);
+  EXPECT_EQ(callback1.greaseFrames, 1);
+
+  // no grease frame will be created in the second bidir stream
+  auto idh2 = checkRequest();
+  flushRequestsAndLoop();
+  FakeHTTPCodecCallback callback2;
+  upstreamCodec->setCallback(&callback2);
+  upstreamCodec->onIngress(
+      *socketDriver_->streams_[idh2.first].writeBuf.front());
+  EXPECT_EQ(callback2.unknownFrames, 0);
+  EXPECT_EQ(callback2.greaseFrames, 0);
+  hqSession_->closeWhenIdle();
+}
+
 TEST_P(HQDownstreamSessionTest, DelegateResponse) {
   if (!IS_HQ) {
     hqSession_->closeWhenIdle();
@@ -2637,48 +2814,100 @@ TEST_P(HQDownstreamSessionTest, getHTTPPriority) {
 // Make sure all the tests keep working with all the supported protocol versions
 INSTANTIATE_TEST_CASE_P(HQDownstreamSessionTest,
                         HQDownstreamSessionTest,
-                        Values(TestParams({.alpn_ = "h1q-fb"}),
-                               TestParams({.alpn_ = "h1q-fb-v2"}),
-                               TestParams({.alpn_ = "h3"})),
+                        Values(
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h1q-fb";
+                              return tp;
+                            }(),
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h1q-fb-v2";
+                              return tp;
+                            }(),
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h3";
+                              return tp;
+                            }()),
                         paramsToTestName);
 
 // Instantiate h1q only tests that work on all versions
 INSTANTIATE_TEST_CASE_P(HQDownstreamSessionTest,
                         HQDownstreamSessionTestH1q,
-                        Values(TestParams({.alpn_ = "h1q-fb"}),
-                               TestParams({.alpn_ = "h1q-fb-v2"})),
+                        Values(
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h1q-fb";
+                              return tp;
+                            }(),
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h1q-fb-v2";
+                              return tp;
+                            }()),
                         paramsToTestName);
 
 // Instantiate common tests for h1q-fb-v2 and hq (goaway)
 INSTANTIATE_TEST_CASE_P(HQDownstreamSessionTest,
                         HQDownstreamSessionTestH1qv2HQ,
-                        Values(TestParams({.alpn_ = "h1q-fb-v2"}),
-                               TestParams({.alpn_ = "h3"})),
+                        Values(
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h1q-fb-v2";
+                              return tp;
+                            }(),
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h3";
+                              return tp;
+                            }()),
                         paramsToTestName);
 
 INSTANTIATE_TEST_CASE_P(HQDownstreamSessionTest,
                         HQDownstreamSessionFilterTestHQ,
-                        Values(TestParams({.alpn_ = "h3",
-                                           .createQPACKStreams_ = true,
-                                           .shouldSendSettings_ = false})),
+                        Values([] {
+                          TestParams tp;
+                          tp.alpn_ = "h3";
+                          tp.createQPACKStreams_ = true;
+                          tp.shouldSendSettings_ = false;
+                          return tp;
+                        }()),
                         paramsToTestName);
 
 INSTANTIATE_TEST_CASE_P(HQDownstreamSessionBeforeTransportReadyTest,
                         HQDownstreamSessionBeforeTransportReadyTest,
-                        Values(TestParams({.alpn_ = "h1q-fb-v2"}),
-                               TestParams({.alpn_ = "h3"})),
+                        Values(
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h1q-fb-v2";
+                              return tp;
+                            }(),
+                            [] {
+                              TestParams tp;
+                              tp.alpn_ = "h3";
+                              return tp;
+                            }()),
                         paramsToTestName);
 
 // Instantiate h1q-fb-v1 only tests
 INSTANTIATE_TEST_CASE_P(HQDownstreamSessionTest,
                         HQDownstreamSessionTestH1qv1,
-                        Values(TestParams({.alpn_ = "h1q-fb"})),
+                        Values([] {
+                          TestParams tp;
+                          tp.alpn_ = "h1q-fb";
+                          return tp;
+                        }()),
                         paramsToTestName);
 
 // Instantiate hq only tests
 INSTANTIATE_TEST_CASE_P(HQDownstreamSessionTest,
                         HQDownstreamSessionTestHQ,
-                        Values(TestParams({.alpn_ = "h3"})),
+                        Values([] {
+                          TestParams tp;
+                          tp.alpn_ = "h3";
+                          return tp;
+                        }()),
                         paramsToTestName);
 
 TEST_P(HQDownstreamSessionTestHQPush, SimplePush) {

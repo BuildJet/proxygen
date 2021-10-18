@@ -80,8 +80,7 @@ HTTPMessage::HTTPMessage()
       chunked_(false),
       upgraded_(false),
       wantsKeepalive_(true),
-      trailersAllowed_(false),
-      secure_(false) {
+      trailersAllowed_(false) {
 }
 
 HTTPMessage::~HTTPMessage() {
@@ -112,7 +111,7 @@ HTTPMessage::HTTPMessage(const HTTPMessage& message)
       upgraded_(message.upgraded_),
       wantsKeepalive_(message.wantsKeepalive_),
       trailersAllowed_(message.trailersAllowed_),
-      secure_(message.secure_) {
+      scheme_(message.scheme_) {
   if (isRequest()) {
     setURL(request().url_);
   }
@@ -152,7 +151,7 @@ HTTPMessage::HTTPMessage(HTTPMessage&& message) noexcept
       upgraded_(message.upgraded_),
       wantsKeepalive_(message.wantsKeepalive_),
       trailersAllowed_(message.trailersAllowed_),
-      secure_(message.secure_) {
+      scheme_(message.scheme_) {
   if (isRequest()) {
     setURL(request().url_);
   }
@@ -194,7 +193,7 @@ HTTPMessage& HTTPMessage::operator=(const HTTPMessage& message) {
   upgraded_ = message.upgraded_;
   wantsKeepalive_ = message.wantsKeepalive_;
   trailersAllowed_ = message.trailersAllowed_;
-  secure_ = message.secure_;
+  scheme_ = message.scheme_;
   upgradeWebsocket_ = message.upgradeWebsocket_;
 
   if (message.trailers_) {
@@ -236,7 +235,7 @@ HTTPMessage& HTTPMessage::operator=(HTTPMessage&& message) {
   upgraded_ = message.upgraded_;
   wantsKeepalive_ = message.wantsKeepalive_;
   trailersAllowed_ = message.trailersAllowed_;
-  secure_ = message.secure_;
+  scheme_ = message.scheme_;
   upgradeWebsocket_ = message.upgradeWebsocket_;
   trailers_ = std::move(message.trailers_);
   return *this;
@@ -539,22 +538,26 @@ const std::map<std::string, std::string>& HTTPMessage::getQueryParams() const {
   return queryParams_;
 }
 
-bool HTTPMessage::setQueryString(const std::string& query) {
-  return setQueryStringImpl(query, true);
+bool HTTPMessage::setQueryString(const std::string& query, bool strict) {
+  return setQueryStringImpl(query, true, strict);
 }
 
-bool HTTPMessage::setQueryStringImpl(const std::string& query, bool unparse) {
-  ParseURL u(request().url_);
+bool HTTPMessage::setQueryStringImpl(const std::string& query,
+                                     bool unparse,
+                                     bool strict) {
+  // No need to strictly verify the URL when reparsing it
+  auto u = ParseURL::parseURL(request().url_, /*strict=*/false);
 
-  if (u.valid()) {
+  if (u) {
     // Recreate the URL by just changing the query string
-    setURLImpl(createUrl(u.scheme(),
-                         u.authority(),
-                         u.path(),
-                         query, // new query string
-                         u.fragment()),
-               unparse);
-    return true;
+    auto res = setURLImpl(createUrl(u->scheme(),
+                                    u->authority(),
+                                    u->path(),
+                                    query, // new query string
+                                    u->fragment()),
+                          unparse,
+                          strict);
+    return !strict || res.valid();
   }
 
   VLOG(4) << "Error parsing URL during setQueryString: " << request().url_;
@@ -573,11 +576,12 @@ bool HTTPMessage::removeQueryParam(const std::string& name) {
   }
 
   auto query = createQueryString(queryParams_, request().query_.size());
-  return setQueryStringImpl(query, false);
+  return setQueryStringImpl(query, false, /*strict=*/false);
 }
 
 bool HTTPMessage::setQueryParam(const std::string& name,
-                                const std::string& value) {
+                                const std::string& value,
+                                bool strict) {
   // Parse the query parameters if we haven't done so yet
   if (!parsedQueryParams_) {
     parseQueryParams();
@@ -585,7 +589,7 @@ bool HTTPMessage::setQueryParam(const std::string& name,
 
   queryParams_[name] = value;
   auto query = createQueryString(queryParams_, request().query_.size());
-  return setQueryStringImpl(query, false);
+  return setQueryStringImpl(query, false, strict);
 }
 
 std::string HTTPMessage::createQueryString(
@@ -722,7 +726,7 @@ void HTTPMessage::dumpMessage(int vlogLevel) const {
 
 void HTTPMessage::describe(std::ostream& os) const {
   os << ", chunked: " << chunked_ << ", upgraded: " << upgraded_
-     << ", secure: " << secure_ << ", Fields for message:" << std::endl;
+     << ", scheme: " << getScheme() << ", Fields for message:" << std::endl;
 
   // Common fields to both requests and responses.
   std::vector<std::pair<const char*, folly::StringPiece>> fields{{
@@ -935,6 +939,16 @@ const char* HTTPMessage::getDefaultReason(uint16_t status) {
       return "Expectation Failed";
     case 418:
       return "I'm a teapot";
+    case 426:
+      return "Upgrade Required";
+    case 428:
+      return "Precondition Required";
+    case 429:
+      return "Too Many Requests";
+    case 431:
+      return "Request Header Fields Too Large";
+    case 451:
+      return "Unavailable For Legal Reasons";
     case 500:
       return "Internal Server Error";
     case 501:
@@ -954,9 +968,9 @@ const char* HTTPMessage::getDefaultReason(uint16_t status) {
   return "-";
 }
 
-ParseURL HTTPMessage::setURLImplInternal(bool unparse) {
+ParseURL HTTPMessage::setURLImplInternal(bool unparse, bool strict) {
   auto& req = request();
-  ParseURL u(req.url_);
+  auto u = ParseURL::parseURLMaybeInvalid(req.url_, strict);
   if (u.valid()) {
     VLOG(9) << "set path: " << u.path() << " query:" << u.query();
     req.path_ = u.path();

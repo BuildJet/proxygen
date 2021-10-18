@@ -40,8 +40,8 @@ class CodecUtil {
   // namespace/class later
   static const char http_tokens[256];
 
-  static bool validateURL(folly::ByteRange url) {
-    return proxygen::validateURL(url);
+  static bool validateURL(folly::ByteRange url, URLValidateMode mode) {
+    return proxygen::validateURL(url, mode);
   }
 
   static bool isalpha(uint8_t c) {
@@ -49,6 +49,19 @@ class CodecUtil {
   }
 
   static bool validateMethod(folly::ByteRange method) {
+    for (auto p = method.begin(); p != method.end(); p++) {
+      // '-' is valid except for start and end
+      if (*p == '-' && p != method.begin() && p != method.end()) {
+        continue;
+      }
+      if (!CodecUtil::isalpha(*p)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool validateScheme(folly::ByteRange method) {
     for (auto p : method) {
       if (!CodecUtil::isalpha(p)) {
         // methods are all characters
@@ -58,13 +71,25 @@ class CodecUtil {
     return true;
   }
 
-  static bool validateHeaderName(folly::ByteRange name) {
+  enum HeaderNameValidationMode {
+    HEADER_NAME_STRICT_COMPAT,
+    HEADER_NAME_STRICT
+  };
+  static bool validateHeaderName(folly::ByteRange name,
+                                 HeaderNameValidationMode mode) {
     if (name.size() == 0) {
       return false;
     }
-    for (auto p : name) {
-      if (p < 0x80 && http_tokens[(uint8_t)p] != p) {
-        return false;
+    for (uint8_t p : name) {
+      if (mode == HEADER_NAME_STRICT_COMPAT) {
+        // Allows ' ', '"', '/', '}' and high ASCII
+        if (p < 0x80 && !http_tokens[p]) {
+          return false;
+        }
+      } else {
+        if ((p < 0x80 && (http_tokens[p] != p)) || p >= 0x80) {
+          return false;
+        }
       }
     }
     return true;
@@ -74,9 +99,13 @@ class CodecUtil {
    * RFC2616 allows certain control chars in header values if they are
    * quoted and escaped.
    * When mode is COMPLIANT, then this is allowed.
-   * When mode is STRICT, no escaped CTLs are allowed
+   * When mode is STRICT*, no escaped CTLs are allowed
+   *
+   * An unfortunate side effect when this function moved from signed to unsigned
+   * chars, the high-ASCII check was broken.  Temporarily continue to allow this
+   * with a special mode.
    */
-  enum CtlEscapeMode { COMPLIANT, STRICT };
+  enum CtlEscapeMode { COMPLIANT, STRICT_COMPAT, STRICT };
 
   static bool validateHeaderValue(folly::ByteRange value, CtlEscapeMode mode) {
     bool escape = false;
@@ -113,7 +142,8 @@ class CodecUtil {
               state = lws_expect_nl;
               break;
             default:
-              if ((*p < 0x20 || *p == 0x7f) && *p != '\t') {
+              if ((*p < 0x20 && *p != '\t') || (*p == 0x7f) ||
+                  (*p > 0x7f && mode == STRICT)) {
                 // unexpected ctl per rfc2616, HT OK
                 return false;
               }

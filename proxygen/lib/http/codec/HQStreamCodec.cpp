@@ -140,7 +140,10 @@ ParseResult HQStreamCodec::parseHeaders(Cursor& cursor,
     callback_->onMessageBegin(streamId_, nullptr);
   }
   decodeInfo_.init(transportDirection_ == TransportDirection::DOWNSTREAM,
-                   parsingTrailers_);
+                   parsingTrailers_,
+                   /*validate=*/true,
+                   strictValidation_,
+                   /*allowEmptyPath=*/false);
   headerCodec_.decodeStreaming(
       streamId_, std::move(outHeaderData), header.length, this);
   // decodeInfo_.msg gets moved in onHeadersComplete.  If it is still around,
@@ -170,7 +173,11 @@ ParseResult HQStreamCodec::parsePushPromise(Cursor& cursor,
     callback_->onPushMessageBegin(outPushId, streamId_, nullptr);
   }
 
-  decodeInfo_.init(true /* isReq */, false /* isRequestTrailers */);
+  decodeInfo_.init(true /* isReq */,
+                   false /* isRequestTrailers */,
+                   /*validate=*/true,
+                   strictValidation_,
+                   /*allowEmptyPath=*/false);
   auto headerDataLength = outHeaderData->computeChainDataLength();
   headerCodec_.decodeStreaming(
       streamId_, std::move(outHeaderData), headerDataLength, this);
@@ -203,9 +210,12 @@ void HQStreamCodec::onHeadersComplete(HTTPHeaderSize decodedSize,
   // Check parsing error
   DCHECK_EQ(decodeInfo_.decodeError, HPACK::DecodeError::NONE);
   // Leave msg in decodeInfo_ for now, to keep the parser paused
-  if (decodeInfo_.parsingError != "") {
+  if (!decodeInfo_.parsingError.empty()) {
     LOG(ERROR) << "Failed parsing header list for stream=" << streamId_
                << ", error=" << decodeInfo_.parsingError;
+    if (!decodeInfo_.headerErrorValue.empty()) {
+      std::cerr << " value=" << decodeInfo_.headerErrorValue << std::endl;
+    }
     HTTPException err(
         HTTPException::Direction::INGRESS,
         folly::format(
@@ -259,7 +269,8 @@ void HQStreamCodec::onDecodeError(HPACK::DecodeError decodeError) {
   CHECK(parserPaused_);
   decodeInfo_.decodeError = decodeError;
   DCHECK_NE(decodeInfo_.decodeError, HPACK::DecodeError::NONE);
-  LOG(ERROR) << "Failed decoding header block for stream=" << streamId_;
+  LOG(ERROR) << "Failed decoding header block for stream=" << streamId_
+             << " decodeError=" << uint32_t(decodeError);
 
   if (decodeInfo_.msg) {
     // print the partial message
@@ -268,11 +279,17 @@ void HQStreamCodec::onDecodeError(HPACK::DecodeError decodeError) {
 
   if (callback_) {
     auto g = folly::makeGuard(activationHook_());
-    HTTPException ex(HTTPException::Direction::INGRESS_AND_EGRESS,
-                     "Stream headers decompression error");
+    HTTPException ex(
+        HTTPException::Direction::INGRESS,
+        folly::to<std::string>("Stream headers decompression error=",
+                               uint32_t(decodeError)));
     ex.setHttp3ErrorCode(HTTP3::ErrorCode::HTTP_QPACK_DECOMPRESSION_FAILED);
-    // HEADERS_TOO_LARGE could be a stream error, maybe?
-    callback_->onError(kSessionStreamId, ex, false);
+    // HEADERS_TOO_LARGE is a stream error, everything else is a session error
+    callback_->onError(decodeError == HPACK::DecodeError::HEADERS_TOO_LARGE
+                           ? streamId_
+                           : kSessionStreamId,
+                       ex,
+                       false);
   }
   // leave the partial msg in decodeInfo, it keeps the parser paused
 }
@@ -338,9 +355,7 @@ void HQStreamCodec::generateHeaderImpl(
     res = hq::writeHeaders(writeBuf, std::move(result));
   }
 
-  if (res.hasValue()) {
-    totalEgressBytes_ += res.value();
-  } else {
+  if (res.hasError()) {
     LOG(ERROR) << __func__ << ": failed to write "
                << ((pushId) ? "push promise: " : "headers: ") << res.error();
   }
@@ -365,7 +380,6 @@ size_t HQStreamCodec::generateBody(folly::IOBufQueue& writeBuf,
 
   size_t bytesWritten = generateBodyImpl(writeBuf, std::move(chain));
 
-  totalEgressBytes_ += bytesWritten;
   return bytesWritten;
 }
 
@@ -387,9 +401,7 @@ size_t HQStreamCodec::generateTrailers(folly::IOBufQueue& writeBuf,
   WriteResult res;
   res = hq::writeHeaders(writeBuf, std::move(encodeRes.stream));
 
-  if (res.hasValue()) {
-    totalEgressBytes_ += res.value();
-  } else {
+  if (res.hasError()) {
     LOG(ERROR) << __func__ << ": failed to write trailers: " << res.error();
     return 0;
   }

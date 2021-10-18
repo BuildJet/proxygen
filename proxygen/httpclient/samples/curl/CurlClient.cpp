@@ -108,7 +108,7 @@ void CurlClient::initializeSsl(const string& caPath,
                                const string& keyPath) {
   sslContext_ = std::make_shared<folly::SSLContext>();
   sslContext_->setOptions(SSL_OP_NO_COMPRESSION);
-  sslContext_->setCipherList(folly::ssl::SSLCommonOptions::ciphers());
+  folly::ssl::setCipherSuites<folly::ssl::SSLCommonOptions>(*sslContext_);
   if (!caPath.empty()) {
     sslContext_->loadTrustedCertificates(caPath.c_str());
   }
@@ -240,6 +240,11 @@ void CurlClient::detachTransaction() noexcept {
 void CurlClient::onHeadersComplete(unique_ptr<HTTPMessage> msg) noexcept {
   response_ = std::move(msg);
   printMessageImpl(response_.get());
+  if (!headersLoggingEnabled_) {
+    return;
+  }
+  response_->describe(*outputStream_);
+  *outputStream_ << std::endl;
 }
 
 void CurlClient::onBody(std::unique_ptr<folly::IOBuf> chain) noexcept {
@@ -277,12 +282,12 @@ void CurlClient::onError(const HTTPException& error) noexcept {
 }
 
 void CurlClient::onEgressPaused() noexcept {
-  LOG_IF(INFO, loggingEnabled_) << "Egress paused";
+  VLOG_IF(1, loggingEnabled_) << "Egress paused";
   egressPaused_ = true;
 }
 
 void CurlClient::onEgressResumed() noexcept {
-  LOG_IF(INFO, loggingEnabled_) << "Egress resumed";
+  VLOG_IF(1, loggingEnabled_) << "Egress resumed";
   egressPaused_ = false;
   if (inputFile_) {
     sendBodyFromFile();

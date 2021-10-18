@@ -32,7 +32,7 @@ namespace proxygen {
       x(tls_expired_peer_certificate), x(tls_handshake_error),                 \
       x(tls_missing_proxy_certificate), x(tls_rejected_proxy_certificate),     \
       x(tls_unexpected_peer_certificate), x(tls_unexpected_peer_identity),     \
-      x(tls_untrusted_peer_certificate),                                       \
+      x(tls_untrusted_peer_certificate), x(http_response_ok),                  \
       /* FB STATUS TYPES */ x(async_request_error), x(client_read_error),      \
       x(client_timeout), x(http_body_before_headers),                          \
       x(http_body_parsing_error), x(http_eom_before_headers),                  \
@@ -44,12 +44,17 @@ namespace proxygen {
       x(sc_content_integrity_error), x(redirect_connect_error),                \
       x(redirect_limit_exceeded), x(redirect_pool_error),                      \
       x(redirect_request_too_large), x(server_connection_error),               \
-      x(server_timeout), x(server_write_error),                                \
+      x(server_timeout), x(server_write_error), x(telephoto_error),            \
+      x(wasm_invocation_error), x(transcode_server_error),                     \
+      x(fbvp_channel_error), x(server_internal_error), x(invalid_pool),        \
+      x(qoe_error), x(sc_downstream_error), x(content_integrity),              \
+      x(bad_request),                                                          \
       /* APP-SPECIFIC STATUS TYPES */ x(manifest_invalid_status),              \
       x(manifest_is_empty), x(manifest_parsing_error),                         \
       x(manifest_missing_representation), x(manifest_with_0_bitrate),          \
       x(manifest_with_no_tracks), x(manifest_with_wrong_track),                \
-      x(cache_lease_queue_hard_timeout), x(ENUM_COUNT)
+      x(cache_lease_queue_hard_timeout), x(cache_purge), x(cache_error),       \
+      x(ENUM_COUNT)
 
 #define STATUS_TYPE_ENUM(statusType) statusType
 

@@ -59,12 +59,18 @@ proxygen::ErrorCode hqToHttpErrorCode(HTTP3::ErrorCode err) {
 
 ProxygenError toProxygenError(quic::QuicErrorCode error, bool fromPeer) {
   switch (error.type()) {
-    case quic::QuicErrorCode::Type::ApplicationErrorCode:
-      if (*error.asApplicationErrorCode() ==
-          HTTP3::ErrorCode::GIVEUP_ZERO_RTT) {
-        return kErrorEarlyDataFailed;
+    case quic::QuicErrorCode::Type::ApplicationErrorCode: {
+      auto h3error = HTTP3::ErrorCode(*error.asApplicationErrorCode());
+      if (h3error == HTTP3::HTTP_NO_ERROR) {
+        return kErrorNone;
+      } else if (isQPACKError(h3error)) {
+        return kErrorBadDecompress;
+      } else if (fromPeer) {
+        return kErrorConnectionReset;
+      } else {
+        return kErrorConnection;
       }
-      return fromPeer ? kErrorConnectionReset : kErrorConnection;
+    }
     case quic::QuicErrorCode::Type::LocalErrorCode:
       return kErrorShutdown;
     case quic::QuicErrorCode::Type::TransportErrorCode:
@@ -81,6 +87,8 @@ folly::Optional<hq::SettingId> httpToHqSettingsId(proxygen::SettingsId id) {
       return hq::SettingId::MAX_HEADER_LIST_SIZE;
     case proxygen::SettingsId::_HQ_QPACK_BLOCKED_STREAMS:
       return hq::SettingId::QPACK_BLOCKED_STREAMS;
+    case proxygen::SettingsId::_HQ_DATAGRAM:
+      return hq::SettingId::H3_DATAGRAM;
     default:
       return folly::none; // this setting has no meaning in HQ
   }
@@ -95,6 +103,8 @@ folly::Optional<proxygen::SettingsId> hqToHttpSettingsId(hq::SettingId id) {
       return proxygen::SettingsId::MAX_HEADER_LIST_SIZE;
     case hq::SettingId::QPACK_BLOCKED_STREAMS:
       return proxygen::SettingsId::_HQ_QPACK_BLOCKED_STREAMS;
+    case hq::SettingId::H3_DATAGRAM:
+      return proxygen::SettingsId::_HQ_DATAGRAM;
   }
   return folly::none;
 }

@@ -169,6 +169,7 @@ QuicServerTransport::Ptr HQServerTransportFactory::make(
     folly::EventBase* evb,
     std::unique_ptr<folly::AsyncUDPSocket> socket,
     const folly::SocketAddress& /* peerAddr */,
+    quic::QuicVersion,
     std::shared_ptr<const FizzServerContext> ctx) noexcept {
   // Session controller is self owning
   auto hqSessionController =
@@ -209,7 +210,11 @@ HQServer::HQServer(
   server_->setSupportedVersion(params_.quicVersions);
   server_->setFizzContext(createFizzServerContext(params_));
   if (params_.rateLimitPerThread) {
-    server_->setRateLimit(params_.rateLimitPerThread.value(), 1s);
+    server_->setRateLimit(
+        [rateLimitPerThread = params_.rateLimitPerThread.value()]() {
+          return rateLimitPerThread;
+        },
+        1s);
   }
 }
 
@@ -240,7 +245,7 @@ void HQServer::stop() {
 }
 
 void HQServer::rejectNewConnections(bool reject) {
-  server_->rejectNewConnections(reject);
+  server_->rejectNewConnections([reject]() { return reject; });
 }
 
 H2Server::SampleHandlerFactory::SampleHandlerFactory(

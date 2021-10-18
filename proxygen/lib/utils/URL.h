@@ -20,10 +20,16 @@ namespace proxygen {
 
 class URL {
  public:
-  explicit URL(const std::string& url = "", bool secure = false) noexcept {
+  URL() = default;
+
+  enum class Mode { STRICT_COMPAT, STRICT };
+  explicit URL(const std::string& url,
+               bool secure = false,
+               Mode strict = Mode::STRICT_COMPAT) noexcept {
     valid_ = false;
 
-    ParseURL parseUrl(url);
+    ParseURL parseUrl =
+        ParseURL::parseURLMaybeInvalid(url, strict == Mode::STRICT);
 
     scheme_ = parseUrl.scheme().str();
     host_ = parseUrl.hostNoBrackets().str();
@@ -39,6 +45,12 @@ class URL {
     } else {
       port_ = isSecure() ? 443 : 80;
     }
+
+    if (strict == Mode::STRICT) {
+      valid_ &= parseUrl.valid();
+    }
+    // TODO: In STRICT_COMPAT, parseUrl.valid() is not checked, so URL.valid()
+    // can be true so long as the scheme is http(s).
   }
 
   static std::string createUrl(const std::string& scheme,
@@ -107,6 +119,13 @@ class URL {
 
   std::string getHostAndPort() const noexcept {
     return port_ ? folly::to<std::string>(host_, ":", port_) : host_;
+  }
+
+  std::string getHostAndPortOmitDefault() const noexcept {
+    return port_ && ((isSecure() && port_ != 443) ||
+                     (!isSecure() && port_ != 80))
+               ? folly::to<std::string>(host_, ":", port_)
+               : host_;
   }
 
   const std::string& getPath() const noexcept {

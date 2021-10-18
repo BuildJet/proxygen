@@ -20,6 +20,7 @@
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/HTTPHeaders.h>
 #include <proxygen/lib/http/HTTPMethod.h>
+#include <proxygen/lib/http/HeaderConstants.h>
 #include <proxygen/lib/utils/ParseURL.h>
 #include <proxygen/lib/utils/Time.h>
 #include <string>
@@ -75,6 +76,12 @@ class HTTPMessage {
     NONE,
     INGRESS,
     EGRESS,
+  };
+
+  enum class Scheme {
+    HTTP,
+    HTTPS,
+    MASQUE,
   };
 
   HTTPMessage();
@@ -247,14 +254,14 @@ class HTTPMessage {
    * valid, this is a full URL, not just a path.
    */
   template <typename T> // T = string
-  ParseURL setURL(T&& url) {
-    return setURLImpl(std::forward<T>(url), true);
+  ParseURL setURL(T&& url, bool strict = false) {
+    return setURLImpl(std::forward<T>(url), true, strict);
   }
 
   // The template function above doesn't work with char*,
   // so explicitly convert to a string first.
-  void setURL(const char* url) {
-    setURL(std::string(url));
+  ParseURL setURL(const char* url, bool strict = false) {
+    return setURL(std::string(url), strict);
   }
   const std::string& getURL() const {
     return request().url_;
@@ -574,7 +581,7 @@ class HTTPMessage {
    *
    * Returns true if the query string was changed successfully.
    */
-  bool setQueryString(const std::string& query);
+  bool setQueryString(const std::string& query, bool strict = false);
 
   /**
    * Remove the query parameter with the specified name.
@@ -588,7 +595,9 @@ class HTTPMessage {
    *
    * Returns true if the query parameter was successfully set.
    */
-  bool setQueryParam(const std::string& name, const std::string& value);
+  bool setQueryParam(const std::string& name,
+                     const std::string& value,
+                     bool strict = false);
 
   /**
    * Get the cookie with the specified name.
@@ -633,28 +642,59 @@ class HTTPMessage {
   }
 
   void setSecure(bool secure) {
-    secure_ = secure;
+    if (secure && scheme_ != Scheme::MASQUE) {
+      scheme_ = Scheme::HTTPS;
+    } else if (!secure) {
+      scheme_ = Scheme::HTTP;
+    }
   }
+
   bool isSecure() const {
-    return secure_;
+    return (scheme_ == Scheme::HTTPS || scheme_ == Scheme::MASQUE);
   }
+
+  void setMasque() {
+    scheme_ = Scheme::MASQUE;
+  }
+
+  bool isMasque() const {
+    return scheme_ == Scheme::MASQUE;
+  }
+
+  const std::string& getScheme() const {
+    switch (scheme_) {
+      case HTTPMessage::Scheme::HTTP:
+        return headers::kHttp;
+      case HTTPMessage::Scheme::HTTPS:
+        return headers::kHttps;
+      case HTTPMessage::Scheme::MASQUE:
+        return headers::kMasque;
+    }
+    return headers::kHttp;
+  }
+
   int getSecureVersion() const {
     return sslVersion_;
   }
+
   const char* getSecureCipher() const {
     return sslCipher_;
   }
+
   void setSecureInfo(int ver, const char* cipher) {
     // cipher is a static const char* provided and managed by openssl lib
     sslVersion_ = ver;
     sslCipher_ = cipher;
   }
+
   void setAdvancedProtocolString(const std::string& protocol) {
     protoStr_ = &protocol;
   }
+
   bool isAdvancedProto() const {
     return protoStr_ != nullptr;
   }
+
   const std::string* getAdvancedProtocolString() const {
     return protoStr_;
   }
@@ -845,17 +885,19 @@ class HTTPMessage {
   void parseCookies() const;
 
   template <typename T> // T = string
-  ParseURL setURLImpl(T&& url, bool unparse) {
+  ParseURL setURLImpl(T&& url, bool unparse, bool strict) {
     VLOG(9) << "setURL: " << url;
 
     // Set the URL, path, and query string parameters
     request().url_ = std::forward<T>(url);
-    return setURLImplInternal(unparse);
+    return setURLImplInternal(unparse, strict);
   }
 
-  ParseURL setURLImplInternal(bool unparse);
+  ParseURL setURLImplInternal(bool unparse, bool strict);
 
-  bool setQueryStringImpl(const std::string& queryString, bool unparse);
+  bool setQueryStringImpl(const std::string& queryString,
+                          bool unparse,
+                          bool strict);
   void parseQueryParams() const;
   void unparseQueryParams();
 
@@ -1016,6 +1058,8 @@ class HTTPMessage {
     if (fields_.which_ == MessageType::NONE) {
       fields_.which_ = MessageType::REQUEST;
       new (&fields_.data_.request) Request();
+    } else if (fields_.which_ == MessageType::RESPONSE) {
+      throw std::runtime_error("Invoked Request API on HTTP Response");
     }
 
     return fields_.data_.request;
@@ -1033,6 +1077,8 @@ class HTTPMessage {
     if (fields_.which_ == MessageType::NONE) {
       fields_.which_ = MessageType::RESPONSE;
       new (&fields_.data_.response) Response();
+    } else if (fields_.which_ == MessageType::REQUEST) {
+      throw std::runtime_error("Invoked Response API on HTTP Request");
     }
 
     return fields_.data_.response;
@@ -1074,8 +1120,7 @@ class HTTPMessage {
   bool wantsKeepalive_ : 1;
   bool trailersAllowed_ : 1;
 
-  // Whether the message is received in HTTPS.
-  bool secure_ : 1;
+  Scheme scheme_{Scheme::HTTP};
 
   // used by atomicDumpMessage
   static std::mutex mutexDump_;

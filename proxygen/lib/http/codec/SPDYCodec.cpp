@@ -1160,7 +1160,8 @@ unique_ptr<HTTPMessage> SPDYCodec::parseHeaders(
     folly::StringPiece name(inHeaders[i].str, off, len);
     folly::StringPiece value = inHeaders[i + 1].str;
     VLOG(5) << "Header " << name << ": " << value;
-    bool nameOk = CodecUtil::validateHeaderName(name);
+    bool nameOk =
+        CodecUtil::validateHeaderName(name, CodecUtil::HEADER_NAME_STRICT);
     bool valueOk = false;
     bool isPath = false;
     bool isMethod = false;
@@ -1174,7 +1175,7 @@ unique_ptr<HTTPMessage> SPDYCodec::parseHeaders(
       }
       if ((version_ == 2 && name == "url") ||
           (version_ == 3 && off && name == "path")) {
-        valueOk = CodecUtil::validateURL(value);
+        valueOk = CodecUtil::validateURL(value, URLValidateMode::STRICT);
         isPath = true;
         if (hasPath) {
           throw SPDYStreamFailed(
@@ -1189,7 +1190,8 @@ unique_ptr<HTTPMessage> SPDYCodec::parseHeaders(
           valueOk = false;
         }
       } else {
-        valueOk = CodecUtil::validateHeaderValue(value, CodecUtil::STRICT);
+        valueOk =
+            CodecUtil::validateHeaderValue(value, CodecUtil::STRICT_COMPAT);
       }
     }
     if (!nameOk || !valueOk) {
@@ -1204,7 +1206,7 @@ unique_ptr<HTTPMessage> SPDYCodec::parseHeaders(
       if (isMethod) {
         msg->setMethod(value);
       } else if (isPath) {
-        msg->setURL(value.str());
+        msg->setURL(value.str(), /*strict=*/true);
       } else if (name == "version") {
         if (caseInsensitiveEqual(value, "http/1.0")) {
           msg->setHTTPVersion(1, 0);
@@ -1291,9 +1293,9 @@ unique_ptr<HTTPMessage> SPDYCodec::parseHeaders(
   }
   if (direction == TransportDirection::DOWNSTREAM) {
     if (version_ == 2 && !headers.exists(HTTP_HEADER_HOST)) {
-      ParseURL url(msg->getURL());
-      if (url.valid()) {
-        headers.add(HTTP_HEADER_HOST, url.hostAndPort());
+      auto url = ParseURL::parseURL(msg->getURL(), /*strict=*/true);
+      if (url) {
+        headers.add(HTTP_HEADER_HOST, url->hostAndPort());
       }
     }
 

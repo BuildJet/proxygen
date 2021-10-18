@@ -19,7 +19,7 @@ namespace proxygen {
 bool HeaderDecodeInfo::onHeader(const HPACKHeaderName& name,
                                 const folly::fbstring& value) {
   // Refuse decoding other headers if an error is already found
-  if (decodeError != HPACK::DecodeError::NONE || parsingError != "") {
+  if (decodeError != HPACK::DecodeError::NONE || !parsingError.empty()) {
     VLOG(4) << "Ignoring header=" << name << " value=" << value
             << " due to parser error=" << parsingError;
     return true;
@@ -45,13 +45,13 @@ bool HeaderDecodeInfo::onHeader(const HPACKHeaderName& name,
           ok = verifier.setScheme(valueSp);
           break;
         case HTTP_HEADER_COLON_AUTHORITY:
-          ok = verifier.setAuthority(valueSp, validate_);
+          ok = verifier.setAuthority(valueSp, validate_, strictValidation_);
           break;
         case HTTP_HEADER_COLON_PATH:
-          ok = verifier.setPath(valueSp);
+          ok = verifier.setPath(valueSp, strictValidation_, allowEmptyPath_);
           break;
         case HTTP_HEADER_COLON_PROTOCOL:
-          ok = verifier.setUpgradeProtocol(valueSp);
+          ok = verifier.setUpgradeProtocol(valueSp, strictValidation_);
           break;
         default:
           parsingError = folly::to<string>("Invalid req header name=", nameSp);
@@ -103,12 +103,19 @@ bool HeaderDecodeInfo::onHeader(const HPACKHeaderName& name,
         break;
     }
     bool nameOk = !validate_ || headerCode != HTTP_HEADER_OTHER ||
-                  CodecUtil::validateHeaderName(nameSp);
-    bool valueOk = !validate_ ||
-                   CodecUtil::validateHeaderValue(valueSp, CodecUtil::STRICT);
+                  CodecUtil::validateHeaderName(
+                      nameSp,
+                      strictValidation_ ? CodecUtil::HEADER_NAME_STRICT
+                                        : CodecUtil::HEADER_NAME_STRICT_COMPAT);
+    bool valueOk =
+        !validate_ ||
+        CodecUtil::validateHeaderValue(
+            valueSp,
+            strictValidation_ ? CodecUtil::CtlEscapeMode::STRICT
+                              : CodecUtil::CtlEscapeMode::STRICT_COMPAT);
     if (!nameOk || !valueOk) {
-      parsingError = folly::to<string>(
-          "Bad header value: name=", nameSp, " value=", valueSp);
+      parsingError = folly::to<string>("Invalid header name=", nameSp);
+      headerErrorValue = valueSp;
       return false;
     }
     // Add the (name, value) pair to headers

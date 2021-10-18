@@ -29,6 +29,10 @@ option(BUILD_SHARED_LIBS
   a stable ABI."
   OFF
 )
+option(BUILD_SAMPLES
+  "If enabled, proxygen will build various examples/samples"
+  ON
+)
 # Mark BUILD_SHARED_LIBS as an "advanced" option, since enabling it
 # is generally discouraged.
 mark_as_advanced(BUILD_SHARED_LIBS)
@@ -78,7 +82,6 @@ find_package(Boost 1.58 REQUIRED
   COMPONENTS
     iostreams
     context
-    date_time
     filesystem
     program_options
     regex
@@ -111,6 +114,10 @@ endif()
 CHECK_CXX_COMPILER_FLAG(-Wdeprecated-register COMPILER_HAS_W_DEPRECATED_REGISTER)
 if (COMPILER_HAS_W_DEPRECATED_REGISTER)
     list(APPEND _PROXYGEN_COMMON_COMPILE_OPTIONS -Wno-deprecated-register)
+endif()
+CHECK_CXX_COMPILER_FLAG(-Wregister COMPILER_HAS_W_REGISTER)
+if (COMPILER_HAS_W_REGISTER)
+    list(APPEND _PROXYGEN_COMMON_COMPILE_OPTIONS -Wno-register)
 endif()
 CHECK_CXX_COMPILER_FLAG(-Wunused-value COMPILER_HAS_W_UNUSED_VALUE)
 if (COMPILER_HAS_W_UNUSED_VALUE)
